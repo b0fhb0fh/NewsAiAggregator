@@ -1,9 +1,5 @@
-pyTelegramBotAPI
-requests
-telethon
-feedparser
-beautifulsoup4
-root@next:/opt/ai-news# cat ai-news-bot.py 
+#!/usr/bin/python3
+
 import telebot
 from telethon import TelegramClient, events
 import requests
