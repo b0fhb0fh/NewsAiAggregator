@@ -1,0 +1,19 @@
+{
+    "TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
+    "SUMMARY_CHANNEL_ID": "@SUMMARY_CHANNEL_ID",
+    "API_ID": "API_ID",
+    "API_HASH": "API_HASH",
+    "PHONE_NUMBER": "+XXXXXXXXXX",
+    "CHANNELS_TO_MONITOR": [
+        "channel1",
+        "channel2",
+        "channel3"
+    ],
+    "OLLAMA_URL": "http://localhost:11434/api/generate",
+    "OLLAMA_MODEL": "llama3.2",
+    "INTEREST_TOPICS": [
+        "theme1", 
+        "theme2", 
+        "theme3" 
+    ]
+}
