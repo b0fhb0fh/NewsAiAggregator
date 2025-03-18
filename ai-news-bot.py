@@ -6,28 +6,44 @@ import requests
 import json
 import logging
 import asyncio
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    filename="bot.log"
-)
+import sys
+import os
 
 # Загрузка конфигурации
-with open("config.json", "r") as config_file:
-    config = json.load(config_file)
+try:
+    with open("config.json", "r") as config_file:
+        config = json.load(config_file)
+except FileNotFoundError:
+    print("Ошибка: файл config.json не найден.")
+    sys.exit(1)
+except json.JSONDecodeError:
+    print("Ошибка: файл config.json имеет неверный формат.")
+    sys.exit(1)
 
-# Конфигурация
+# Конфигурация (обязательные параметры)
 TELEGRAM_BOT_TOKEN = config["TELEGRAM_BOT_TOKEN"]
 SUMMARY_CHANNEL_ID = config["SUMMARY_CHANNEL_ID"]
 API_ID = config["API_ID"]
 API_HASH = config["API_HASH"]
 PHONE_NUMBER = config["PHONE_NUMBER"]
 OLLAMA_URL = config["OLLAMA_URL"]
-OLLAMA_MODEL = config["OLLAMA_MODEL"]  # Название модели ИИ
+OLLAMA_MODEL = config["OLLAMA_MODEL"]
 INTEREST_TOPICS = config["INTEREST_TOPICS"]
 CHANNELS_TO_MONITOR = config["CHANNELS_TO_MONITOR"]
+
+# Необязательные параметры (с значениями по умолчанию)
+CHECK_INTERVAL = config.get("CHECK_INTERVAL", 300)  # Значение по умолчанию: 300 секунд
+LOG_LEVEL = config.get("LOG_LEVEL", "INFO")  # Значение по умолчанию: INFO
+
+# Настройка логирования
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()  # Вывод логов в консоль
+    ]
+)
 
 # Инициализация бота
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
@@ -45,7 +61,7 @@ def check_topic_relevance(text):
             f"Ответь только 'Да' или 'Нет'.\n\nСообщение: {text}"
         )
         payload = {
-            "model": OLLAMA_MODEL,  # Используем модель из конфигурации
+            "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False
         }
