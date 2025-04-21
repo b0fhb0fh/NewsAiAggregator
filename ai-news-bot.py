@@ -8,6 +8,23 @@ import logging
 import asyncio
 import sys
 import os
+import time
+import signal
+import threading
+from threading import Event
+
+# Флаг для graceful shutdown
+shutdown = False
+
+def signal_handler(sig, frame):
+    global shutdown
+    logging.info("Получен сигнал завершения, начинаем shutdown...")
+    shutdown = True
+
+# Регистрация обработчика сигналов
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 
 # Загрузка конфигурации
 try:
@@ -156,27 +173,60 @@ async def handle_new_message(event):
     except Exception as e:
         logging.error(f"Ошибка в обработчике handle_new_message: {e}")
 
-# Запуск Telethon клиента
-async def start_telethon_client():
+async def run_telethon():
     try:
         logging.info("Запуск Telethon клиента...")
         await client.start(PHONE_NUMBER)
         logging.info("Telethon клиент успешно запущен.")
-        await client.run_until_disconnected()
+        
+        # Ждем флаг завершения
+        while not shutdown:
+            await asyncio.sleep(1)
+            
     except Exception as e:
-        logging.error(f"Ошибка при запуске Telethon клиента: {e}")
+        logging.error(f"Ошибка в Telethon клиенте: {e}")
+    finally:
+        await client.disconnect()
+        logging.info("Telethon клиент остановлен.")
 
-# Запуск бота
-if __name__ == "__main__":
+def run_bot():
     try:
         logging.info("Запуск бота...")
-        # Запускаем Telethon клиент в отдельном потоке
-        import threading
-        telethon_thread = threading.Thread(target=lambda: asyncio.run(start_telethon_client()))
-        telethon_thread.start()
-
-        # Запускаем Telegram-бота
-        logging.info("Telegram-бот запущен.")
-        bot.polling(none_stop=True)
+        bot.polling(none_stop=True, interval=1)
     except Exception as e:
-        logging.error(f"Ошибка при запуске бота: {e}")
+        logging.error(f"Ошибка в боте: {e}")
+    finally:
+        logging.info("Бот остановлен")
+
+async def main():
+    # Запускаем Telethon в отдельной задаче
+    telethon_task = asyncio.create_task(run_telethon())
+    
+    # Запускаем бота в отдельном потоке
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    # Основной цикл
+    try:
+        while not shutdown:
+            await asyncio.sleep(1)
+    finally:
+        # Останавливаем задачи
+        telethon_task.cancel()
+        try:
+            await telethon_task
+        except asyncio.CancelledError:
+            pass
+        
+        # Останавливаем бота
+        bot.stop_polling()
+        bot_thread.join(timeout=2)
+        logging.info("Приложение полностью остановлено")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+        
