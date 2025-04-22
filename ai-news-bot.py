@@ -75,7 +75,7 @@ def check_topic_relevance(text):
         # Формируем запрос к Ollama
         prompt = (
             f"Прочитай это сообщение и определи, относится ли оно к одной из этих тем: {', '.join(INTEREST_TOPICS)}. "
-            f"Ответь только 'Да' или 'Нет'.\n\nСообщение: {text}"
+            f"Ответь только 'Да' или 'Нет'.\n\nСообщение: {text}\n\n Если сообщение носит рекламный характер, отвечай 'Нет'."
         )
         payload = {
             "model": OLLAMA_MODEL,
@@ -99,25 +99,33 @@ def check_topic_relevance(text):
 async def send_media_to_channel(chat_username, message):
     try:
         logging.info(f"Попытка отправить медиафайл из {chat_username}.")
+
+        # Формируем подпись (приоритет: caption > text > стандартная подпись)
+        caption = (
+            message.caption 
+            or message.text 
+            or f"📷 Медиа из @{chat_username}"
+        )
+
         if message.photo:  # Если сообщение содержит фото
             file_id = message.photo[-1].file_id  # Берем самое большое фото
-            await bot.send_photo(SUMMARY_CHANNEL_ID, file_id, caption=message.text if message.text else f"📷 Фото из {chat_username}")
+            await bot.send_photo(SUMMARY_CHANNEL_ID, file_id, caption=caption)
 
         elif message.video:  # Если сообщение содержит видео
             file_id = message.video.file_id
-            await bot.send_video(SUMMARY_CHANNEL_ID, file_id, caption=message.text if message.text else f"🎥 Видео из {chat_username}")
+            await bot.send_video(SUMMARY_CHANNEL_ID, file_id, caption=caption)
 
         elif message.document:  # Если сообщение содержит документ
             file_id = message.document.file_id
-            await bot.send_document(SUMMARY_CHANNEL_ID, file_id, caption=message.text if message.text else f"📄 Документ из {chat_username}")
+            await bot.send_document(SUMMARY_CHANNEL_ID, file_id, caption=caption)
 
         elif message.audio:  # Если сообщение содержит аудио
             file_id = message.audio.file_id
-            await bot.send_audio(SUMMARY_CHANNEL_ID, file_id, caption=message.text if message.text else f"🎵 Аудио из {chat_username}")
+            await bot.send_audio(SUMMARY_CHANNEL_ID, file_id, caption=caption)
 
         elif message.voice:  # Если сообщение содержит голосовое сообщение
             file_id = message.voice.file_id
-            await bot.send_voice(SUMMARY_CHANNEL_ID, file_id, caption=message.text if message.text else f"🎤 Голосовое сообщение из {chat_username}")
+            await bot.send_voice(SUMMARY_CHANNEL_ID, file_id, caption=caption)
 
         logging.info(f"Медиафайл из {chat_username} отправлен.")
     except Exception as e:
@@ -229,4 +237,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
-        
