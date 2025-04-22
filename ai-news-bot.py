@@ -126,6 +126,10 @@ async def send_media_to_channel(chat_username, message):
         
         # Определяем тип контента и отправляем
         if message.photo:
+            # Если photo — это список (aiogram 2.x), берем последний элемент
+            # Если photo — это объект (aiogram 3.x), берем его напрямую
+            file_id = message.photo[-1].file_id if isinstance(message.photo, list) else message.photo.file_id
+
             await bot.send_photo(
                 chat_id=SUMMARY_CHANNEL_ID,
                 photo=message.photo[-1].file_id,
