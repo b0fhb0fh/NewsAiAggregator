@@ -136,8 +136,11 @@ async def send_media_to_channel(chat_username, message):
 async def handle_new_message(event):
     try:
         # Проверяем, что сообщение из одного из каналов в списке
-        chat_username = event.chat.username if event.chat.username else str(event.chat.id)
-        logging.info(f"Получено сообщение из {chat_username}.")
+        chat_username = event.chat.username if event.chat and event.chat.username else str(event.chat.id) if event.chat else "unknown"
+        if not event.chat:
+            logging.warning(f"Сообщение без чата! Content: {event.text or 'Media'}")
+        else:
+            logging.info(f"Получено сообщение из {chat_username}.")
         
         if chat_username in CHANNELS_TO_MONITOR:
             logging.info(f"Сообщение из {chat_username} находится в списке для мониторинга.")
