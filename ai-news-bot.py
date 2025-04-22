@@ -97,39 +97,93 @@ def check_topic_relevance(text):
 
 # Функция для отправки медиафайлов в целевой канал
 async def send_media_to_channel(chat_username, message):
+    """
+    Отправляет медиафайлы или текст в целевой канал с обработкой всех типов контента.
+    
+    Параметры:
+        chat_username: Имя пользователя или ID чата-источника
+        message: Объект сообщения от aiogram
+        
+    Обрабатывает:
+        - Фото
+        - Видео
+        - Документы
+        - Аудио
+        - Голосовые сообщения
+        - Текстовые сообщения
+        - Стикеры
+        - Анимации (GIF)
+    """
     try:
-        logging.info(f"Попытка отправить медиафайл из {chat_username}.")
-
-        # Формируем подпись (приоритет: caption > text > стандартная подпись)
+        logging.info(f"Попытка отправить контент из {chat_username}")
+        
+        # Безопасное формирование подписи
         caption = (
-            message.caption 
-            or message.text 
-            or f"📷 Медиа из @{chat_username}"
+            getattr(message, 'caption', None)  # Пробуем получить caption (если есть)
+            or message.text  # Или текст сообщения
+            or f"📷 Медиа из @{chat_username}"  # Или заглушка
         )
-
-        if message.photo:  # Если сообщение содержит фото
-            file_id = message.photo[-1].file_id  # Берем самое большое фото
-            await bot.send_photo(SUMMARY_CHANNEL_ID, file_id, caption=caption)
-
-        elif message.video:  # Если сообщение содержит видео
-            file_id = message.video.file_id
-            await bot.send_video(SUMMARY_CHANNEL_ID, file_id, caption=caption)
-
-        elif message.document:  # Если сообщение содержит документ
-            file_id = message.document.file_id
-            await bot.send_document(SUMMARY_CHANNEL_ID, file_id, caption=caption)
-
-        elif message.audio:  # Если сообщение содержит аудио
-            file_id = message.audio.file_id
-            await bot.send_audio(SUMMARY_CHANNEL_ID, file_id, caption=caption)
-
-        elif message.voice:  # Если сообщение содержит голосовое сообщение
-            file_id = message.voice.file_id
-            await bot.send_voice(SUMMARY_CHANNEL_ID, file_id, caption=caption)
-
-        logging.info(f"Медиафайл из {chat_username} отправлен.")
+        
+        # Определяем тип контента и отправляем
+        if message.photo:
+            await bot.send_photo(
+                chat_id=SUMMARY_CHANNEL_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption[:1024]  # Ограничение длины подписи в Telegram
+            )
+            
+        elif message.video:
+            await bot.send_video(
+                chat_id=SUMMARY_CHANNEL_ID,
+                video=message.video.file_id,
+                caption=caption[:1024]
+            )
+            
+        elif message.document:
+            await bot.send_document(
+                chat_id=SUMMARY_CHANNEL_ID,
+                document=message.document.file_id,
+                caption=caption[:1024]
+            )
+            
+        elif message.audio:
+            await bot.send_audio(
+                chat_id=SUMMARY_CHANNEL_ID,
+                audio=message.audio.file_id,
+                caption=caption[:1024]
+            )
+            
+        elif message.voice:
+            await bot.send_voice(
+                chat_id=SUMMARY_CHANNEL_ID,
+                voice=message.voice.file_id,
+                caption=caption[:1024] if caption else None
+            )
+            
+        elif message.sticker:
+            await bot.send_sticker(
+                chat_id=SUMMARY_CHANNEL_ID,
+                sticker=message.sticker.file_id
+            )
+            
+        elif message.animation:
+            await bot.send_animation(
+                chat_id=SUMMARY_CHANNEL_ID,
+                animation=message.animation.file_id,
+                caption=caption[:1024]
+            )
+            
+        elif message.text:
+            await bot.send_message(
+                chat_id=SUMMARY_CHANNEL_ID,
+                text=message.text
+            )
+            
+        logging.info(f"Контент из {chat_username} успешно отправлен")
+        
     except Exception as e:
-        logging.error(f"Ошибка при отправке медиафайла: {e}")
+        logging.error(f"Ошибка при отправке контента из {chat_username}: {str(e)}")
+        raise  # Пробрасываем исключение для обработки выше
 
 # Обработчик новых сообщений из каналов
 @client.on(events.NewMessage)
