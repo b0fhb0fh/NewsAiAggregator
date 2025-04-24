@@ -2,6 +2,8 @@
 
 import telebot
 from telethon import TelegramClient, events
+from telethon.tl import types
+import io
 import requests
 import json
 import logging
@@ -96,98 +98,68 @@ def check_topic_relevance(text):
         return False
 
 # Функция для отправки медиафайлов в целевой канал
+from io import BytesIO
+
 async def send_media_to_channel(chat_username, message):
     """
-    Отправляет медиафайлы или текст в целевой канал с обработкой всех типов контента.
-    
-    Параметры:
-        chat_username: Имя пользователя или ID чата-источника
-        message: Объект сообщения от aiogram
-        
-    Обрабатывает:
-        - Фото
-        - Видео
-        - Документы
-        - Аудио
-        - Голосовые сообщения
-        - Текстовые сообщения
-        - Стикеры
-        - Анимации (GIF)
+    Отправляет медиа в канал без сохранения на диск
+    Работает полностью в оперативной памяти через BytesIO
     """
     try:
-        logging.info(f"Попытка отправить контент из {chat_username}")
-        
-        # Безопасное формирование подписи
-        caption = (
-            getattr(message, 'caption', None)  # Пробуем получить caption (если есть)
-            or message.text  # Или текст сообщения
-            or f"📷 Медиа из @{chat_username}"  # Или заглушка
-        )
-        
-        # Определяем тип контента и отправляем
-        if message.photo:
-            # Если photo — это список (aiogram 2.x), берем последний элемент
-            # Если photo — это объект (aiogram 3.x), берем его напрямую
-            file_id = message.photo[-1].file_id if isinstance(message.photo, list) else message.photo.file_id
+        logging.info(f"Отправка контента из {chat_username}")
 
+        # Формируем подпись
+        caption = (
+            message.text 
+            or getattr(message, 'message', '')
+            or f"📷 Медиа из @{chat_username}"
+        )#[:1024]
+
+        if not message.media:
+            if caption:
+                await bot.send_message(SUMMARY_CHANNEL_ID, text=caption, parse_mod="HTML")
+            return
+
+        # Скачиваем медиа в память
+        media_bytes = BytesIO()
+        await message.download_media(file=media_bytes)
+        media_bytes.seek(0)  # Перемотка в начало
+
+        # Определяем тип медиа
+        if isinstance(message.media, types.MessageMediaPhoto):
             await bot.send_photo(
                 chat_id=SUMMARY_CHANNEL_ID,
-                photo=message.photo[-1].file_id,
-                caption=caption[:1024]  # Ограничение длины подписи в Telegram
+                photo=media_bytes,
+                caption=caption
             )
+        elif isinstance(message.media, types.MessageMediaDocument):
+            doc = message.media.document
             
-        elif message.video:
-            await bot.send_video(
-                chat_id=SUMMARY_CHANNEL_ID,
-                video=message.video.file_id,
-                caption=caption[:1024]
-            )
-            
-        elif message.document:
-            await bot.send_document(
-                chat_id=SUMMARY_CHANNEL_ID,
-                document=message.document.file_id,
-                caption=caption[:1024]
-            )
-            
-        elif message.audio:
-            await bot.send_audio(
-                chat_id=SUMMARY_CHANNEL_ID,
-                audio=message.audio.file_id,
-                caption=caption[:1024]
-            )
-            
-        elif message.voice:
-            await bot.send_voice(
-                chat_id=SUMMARY_CHANNEL_ID,
-                voice=message.voice.file_id,
-                caption=caption[:1024] if caption else None
-            )
-            
-        elif message.sticker:
-            await bot.send_sticker(
-                chat_id=SUMMARY_CHANNEL_ID,
-                sticker=message.sticker.file_id
-            )
-            
-        elif message.animation:
-            await bot.send_animation(
-                chat_id=SUMMARY_CHANNEL_ID,
-                animation=message.animation.file_id,
-                caption=caption[:1024]
-            )
-            
-        elif message.text:
-            await bot.send_message(
-                chat_id=SUMMARY_CHANNEL_ID,
-                text=message.text
-            )
-            
-        logging.info(f"Контент из {chat_username} успешно отправлен")
-        
+            if any(x in doc.mime_type for x in ['video', 'gif']):
+                await bot.send_video(
+                    chat_id=SUMMARY_CHANNEL_ID,
+                    video=media_bytes,
+                    caption=caption
+                )
+            elif 'audio' in doc.mime_type:
+                await bot.send_audio(
+                    chat_id=SUMMARY_CHANNEL_ID,
+                    audio=media_bytes,
+                    caption=caption
+                )
+            else:
+                await bot.send_document(
+                    chat_id=SUMMARY_CHANNEL_ID,
+                    document=media_bytes,
+                    caption=caption,
+                    file_name=getattr(doc, 'attributes', [{}])[0].get('file_name', 'file')
+                )
+
     except Exception as e:
-        logging.error(f"Ошибка при отправке контента из {chat_username}: {str(e)}")
-        raise  # Пробрасываем исключение для обработки выше
+        logging.error(f"Ошибка отправки: {str(e)}")
+        raise
+    finally:
+        media_bytes.close() if 'media_bytes' in locals() else None
 
 # Обработчик новых сообщений из каналов
 @client.on(events.NewMessage)
