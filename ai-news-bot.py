@@ -14,6 +14,8 @@ import time
 import signal
 import threading
 from threading import Event
+from io import BytesIO
+import asyncio
 
 # Флаг для graceful shutdown
 shutdown = False
@@ -77,7 +79,7 @@ def check_topic_relevance(text):
         # Формируем запрос к Ollama
         prompt = (
             f"Прочитай это сообщение и определи, относится ли оно к одной из этих тем: {', '.join(INTEREST_TOPICS)}. "
-            f"Ответь только 'Да' или 'Нет'.\n\nСообщение: {text}\n\n Если сообщение носит рекламный характер, отвечай 'Нет'."
+            f"Ответь только 'Да' или 'Нет'.\n\nСообщение: {text}"
         )
         payload = {
             "model": OLLAMA_MODEL,
@@ -98,121 +100,80 @@ def check_topic_relevance(text):
         return False
 
 # Функция для отправки медиафайлов в целевой канал
-from io import BytesIO
+async def send_media_to_channel(chat_username, event):
+    """Надежная отправка медиа через временный буфер в памяти"""
+    async def download_media_to_buffer():
+        buffer = BytesIO()
+        await event.download_media(file=buffer)
+        buffer.seek(0)
+        return buffer
 
-async def send_media_to_channel(chat_username, message):
-    """
-    Отправляет медиа в канал без сохранения на диск
-    Работает полностью в оперативной памяти через BytesIO
-    """
-    try:
-        logging.info(f"Отправка контента из {chat_username}")
-
-        # Формируем подпись
-        caption = (
-            message.text 
-            or getattr(message, 'message', '')
-            or f"📷 Медиа из @{chat_username}"
-        )#[:1024]
-
-        if not message.media:
-            if caption:
-                await bot.send_message(SUMMARY_CHANNEL_ID, text=caption, parse_mod="HTML")
-            return
-
-        # Скачиваем медиа в память
-        media_bytes = BytesIO()
-        await message.download_media(file=media_bytes)
-        media_bytes.seek(0)  # Перемотка в начало
-
-        # Определяем тип медиа
-        if isinstance(message.media, types.MessageMediaPhoto):
-            await bot.send_photo(
-                chat_id=SUMMARY_CHANNEL_ID,
-                photo=media_bytes,
-                caption=caption
-            )
-        elif isinstance(message.media, types.MessageMediaDocument):
-            doc = message.media.document
-            
-            if any(x in doc.mime_type for x in ['video', 'gif']):
-                await bot.send_video(
+    def sync_send(buffer, caption, media_type):
+        try:
+            if media_type == 'photo':
+                bot.send_photo(
                     chat_id=SUMMARY_CHANNEL_ID,
-                    video=media_bytes,
-                    caption=caption
-                )
-            elif 'audio' in doc.mime_type:
-                await bot.send_audio(
-                    chat_id=SUMMARY_CHANNEL_ID,
-                    audio=media_bytes,
-                    caption=caption
-                )
-            else:
-                await bot.send_document(
-                    chat_id=SUMMARY_CHANNEL_ID,
-                    document=media_bytes,
+                    photo=buffer,
                     caption=caption,
-                    file_name=getattr(doc, 'attributes', [{}])[0].get('file_name', 'file')
+                    parse_mode="HTML"
                 )
+            elif media_type == 'document':
+                bot.send_document(
+                    chat_id=SUMMARY_CHANNEL_ID,
+                    document=buffer,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+            buffer.close()
+        except Exception as e:
+            logging.error(f"Ошибка отправки: {str(e)}")
+            buffer.close()
+            raise
+
+    try:
+        message = event.message
+        caption = (message.text or f"📷 Медиа из @{chat_username}")
+
+        if message.media:
+            # Загружаем медиа в память
+            buffer = await download_media_to_buffer()
+            
+            # Определяем тип медиа
+            if isinstance(message.media, types.MessageMediaPhoto):
+                await asyncio.to_thread(sync_send, buffer, caption, 'photo')
+            else:
+                await asyncio.to_thread(sync_send, buffer, caption, 'document')
+
+        elif message.text:
+            await asyncio.to_thread(
+                lambda: bot.send_message(
+                    chat_id=SUMMARY_CHANNEL_ID,
+                    text=caption,
+                    parse_mode="HTML"
+                )
+            )
 
     except Exception as e:
-        logging.error(f"Ошибка отправки: {str(e)}")
-        raise
-    finally:
-        media_bytes.close() if 'media_bytes' in locals() else None
+        logging.error(f"Фатальная ошибка: {str(e)}", exc_info=True)
 
 # Обработчик новых сообщений из каналов
-@client.on(events.NewMessage)
+@client.on(events.NewMessage(chats=CHANNELS_TO_MONITOR))
 async def handle_new_message(event):
     try:
-        # Проверяем, что сообщение из одного из каналов в списке
-        chat_username = event.chat.username if event.chat and event.chat.username else str(event.chat.id) if event.chat else "unknown"
-        if not event.chat:
-            logging.warning(f"Сообщение без чата! Content: {event.text or 'Media'}")
-        else:
-            logging.info(f"Получено сообщение из {chat_username}.")
+        chat = event.chat
+        chat_username = chat.username if chat and chat.username else f"id{chat.id}" if chat else "unknown"
         
-        if chat_username in CHANNELS_TO_MONITOR:
-            logging.info(f"Сообщение из {chat_username} находится в списке для мониторинга.")
+        logging.info(f"Новое сообщение из {chat_username}")
+        
+        # Проверка релевантности (ваш существующий код)
+        message_text = event.message.text or ""
+        is_relevant = check_topic_relevance(message_text) if message_text else True
+        
+        if is_relevant:
+            await send_media_to_channel(chat_username, event)  # Передаем event, а не message
             
-            # Получаем текст сообщения с форматированием (включая гиперссылки)
-            message_text = event.message.text if event.message.text else ""
-            logging.info(f"Текст сообщения: {message_text}")
-
-            # Если есть текст, проверяем его на принадлежность к интересуемым темам
-            if message_text:
-                logging.info("Проверка текста на релевантность.")
-                is_relevant = check_topic_relevance(message_text)
-                logging.info(f"Сообщение относится к интересуемым темам: {is_relevant}")
-            else:
-                # Если текста нет, считаем сообщение релевантным (например, только медиа)
-                is_relevant = True
-                logging.info("Сообщение не содержит текста, считается релевантным.")
-
-            if is_relevant:
-                # Если есть медиафайлы, отправляем их
-                if event.message.media:
-                    logging.info("Сообщение содержит медиафайлы.")
-                    await send_media_to_channel(chat_username, event.message)
-
-                # Если есть текст, отправляем его
-                if message_text:
-                    try:
-                        logging.info("Попытка отправить текстовое сообщение.")
-                        await bot.send_message(
-                            SUMMARY_CHANNEL_ID,
-                            message_text,
-                            parse_mode="HTML"  # Сохраняем форматирование
-                        )
-                        logging.info(f"Сообщение из {chat_username} опубликовано.")
-                    except Exception as e:
-                        logging.error(f"Ошибка при публикации текстового сообщения: {e}")
-            else:
-                logging.info(f"Сообщение из {chat_username} не соответствует темам.")
-        else:
-            logging.info(f"Сообщение из {chat_username} не в списке для мониторинга.")
     except Exception as e:
-        logging.error(f"Ошибка в обработчике handle_new_message: {e}")
+        logging.error(f"Ошибка обработки: {str(e)}", exc_info=True)
 
 async def run_telethon():
     try:
