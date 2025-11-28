@@ -3,6 +3,7 @@
 import telebot
 from telethon import TelegramClient, events
 from telethon.tl import types
+from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
 import io
 import requests
 import json
@@ -15,7 +16,6 @@ import signal
 import threading
 from threading import Event
 from io import BytesIO
-import asyncio
 
 # Флаг для graceful shutdown
 shutdown = False
@@ -99,16 +99,47 @@ def check_topic_relevance(text):
         logging.error(f"Ошибка в функции check_topic_relevance: {e}")
         return False
 
+def format_text(text, source=None):
+    """
+    Форматирует текст для Telegram с HTML-разметкой
+    Args:
+        text: Исходный текст
+        source: Имя источника (добавляется в подпись)
+    Returns:
+        str: Отформатированный текст с HTML-тегами
+    """
+    if not text:
+        return f"<b>📷 Медиа из @{source}</b>" if source else ""
+    
+    # Удаляем Markdown-разметку (**) если есть
+    text = text.replace("**", "").replace("__", "")
+    
+    # Добавляем HTML-теги
+    formatted_text = f"<b>{text.strip()}</b>"
+    
+    # Добавляем источник если указан
+    if source:
+        formatted_text += f"\n\n<b>Источник:</b> @{source}"
+    
+    return formatted_text
+
 # Функция для отправки медиафайлов в целевой канал
 async def send_media_to_channel(chat_username, event):
-    """Надежная отправка медиа через временный буфер в памяти"""
+    """Безопасная отправка медиа с обработкой всех ошибок"""
     async def download_media_to_buffer():
         buffer = BytesIO()
-        await event.download_media(file=buffer)
-        buffer.seek(0)
-        return buffer
+        try:
+            await event.download_media(file=buffer)
+            buffer.seek(0)
+            if buffer.getbuffer().nbytes == 0:
+                raise ValueError("Получен пустой файл")
+            return buffer
+        except Exception as e:
+            buffer.close()
+            raise
 
-    def sync_send(buffer, caption, media_type):
+    def sync_send_media(buffer, caption, media_type):
+        """Синхронная отправка медиа"""
         try:
             if media_type == 'photo':
                 bot.send_photo(
@@ -124,56 +155,90 @@ async def send_media_to_channel(chat_username, event):
                     caption=caption,
                     parse_mode="HTML"
                 )
+        finally:
             buffer.close()
-        except Exception as e:
-            logging.error(f"Ошибка отправки: {str(e)}")
-            buffer.close()
-            raise
 
     try:
         message = event.message
-        caption = (message.text or f"📷 Медиа из @{chat_username}")
+        caption = format_text(message.text or "", chat_username)
 
-        if message.media:
-            # Загружаем медиа в память
-            buffer = await download_media_to_buffer()
-            
-            # Определяем тип медиа
-            if isinstance(message.media, types.MessageMediaPhoto):
-                await asyncio.to_thread(sync_send, buffer, caption, 'photo')
-            else:
-                await asyncio.to_thread(sync_send, buffer, caption, 'document')
+        # Обработка текстового сообщения без медиа
+        if not hasattr(message, 'media') or not message.media:
+            if message.text:
+                await asyncio.to_thread(
+                    lambda: bot.send_message(
+                        chat_id=SUMMARY_CHANNEL_ID,
+                        text=caption,
+                        parse_mode="HTML"
+                    )
+                )
+            return
 
-        elif message.text:
+        # Определение типа медиа
+        if isinstance(message.media, types.MessageMediaPhoto):
+            media_type = 'photo'
+        elif isinstance(message.media, types.MessageMediaDocument):
+            media_type = 'document'
+        else:
+            logging.warning(f"Неподдерживаемый тип медиа: {type(message.media)}")
+            return
+
+        # Загрузка и отправка медиа
+        buffer = await download_media_to_buffer()
+        await asyncio.to_thread(sync_send_media, buffer, caption, media_type)
+
+    except Exception as e:
+        logging.error(f"Ошибка отправки: {str(e)}", exc_info=True)
+        # Отправка текста как запасного варианта
+        if hasattr(message, 'text') and message.text:
             await asyncio.to_thread(
                 lambda: bot.send_message(
                     chat_id=SUMMARY_CHANNEL_ID,
-                    text=caption,
+                    text=f"⚠️ Ошибка вложения\n\n{format_text(message.text, chat_username)}",
                     parse_mode="HTML"
                 )
             )
-
-    except Exception as e:
-        logging.error(f"Фатальная ошибка: {str(e)}", exc_info=True)
-
+            
 # Обработчик новых сообщений из каналов
-@client.on(events.NewMessage(chats=CHANNELS_TO_MONITOR))
 async def handle_new_message(event):
     try:
         chat = event.chat
         chat_username = chat.username if chat and chat.username else f"id{chat.id}" if chat else "unknown"
-        
+
         logging.info(f"Новое сообщение из {chat_username}")
         
-        # Проверка релевантности (ваш существующий код)
         message_text = event.message.text or ""
         is_relevant = check_topic_relevance(message_text) if message_text else True
         
         if is_relevant:
-            await send_media_to_channel(chat_username, event)  # Передаем event, а не message
-            
+            await send_media_to_channel(chat_username, event)
+
     except Exception as e:
         logging.error(f"Ошибка обработки: {str(e)}", exc_info=True)
+
+# Функция для валидации и фильтрации каналов
+async def validate_channels(channels):
+    """Валидирует список каналов и возвращает только валидные"""
+    valid_channels = []
+    invalid_channels = []
+    
+    for channel in channels:
+        try:
+            # Пытаемся получить entity канала
+            entity = await client.get_entity(channel)
+            valid_channels.append(entity)
+            logging.info(f"Канал {channel} успешно валидирован")
+        except (UsernameInvalidError, UsernameNotOccupiedError, ValueError) as e:
+            invalid_channels.append(channel)
+            logging.warning(f"Канал {channel} невалиден или недоступен: {e}")
+        except Exception as e:
+            invalid_channels.append(channel)
+            logging.error(f"Ошибка при валидации канала {channel}: {e}")
+    
+    if invalid_channels:
+        logging.warning(f"Следующие каналы будут пропущены: {', '.join(invalid_channels)}")
+    
+    return valid_channels
 
 async def run_telethon():
     try:
@@ -181,12 +246,29 @@ async def run_telethon():
         await client.start(PHONE_NUMBER)
         logging.info("Telethon клиент успешно запущен.")
         
+        # Валидируем каналы и регистрируем обработчик только для валидных
+        logging.info(f"Валидация {len(CHANNELS_TO_MONITOR)} каналов...")
+        valid_channels = await validate_channels(CHANNELS_TO_MONITOR)
+        
+        if not valid_channels:
+            logging.error("Нет валидных каналов для мониторинга!")
+            return
+        
+        logging.info(f"Регистрация обработчика для {len(valid_channels)} валидных каналов")
+        
+        # Регистрируем обработчик для валидных каналов
+        @client.on(events.NewMessage(chats=valid_channels))
+        async def message_handler(event):
+            await handle_new_message(event)
+        
+        logging.info("Обработчик сообщений успешно зарегистрирован")
+        
         # Ждем флаг завершения
         while not shutdown:
             await asyncio.sleep(1)
             
     except Exception as e:
-        logging.error(f"Ошибка в Telethon клиенте: {e}")
+        logging.error(f"Ошибка в Telethon клиенте: {e}", exc_info=True)
     finally:
         await client.disconnect()
         logging.info("Telethon клиент остановлен.")
