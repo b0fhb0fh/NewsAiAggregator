@@ -1,0 +1,13 @@
+{
+    "TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+    "SUMMARY_CHANNEL_ID": "@your_summary_channel",
+    "API_ID": "YOUR_API_ID",
+    "API_HASH": "YOUR_API_HASH",
+    "PHONE_NUMBER": "YOUR_PHONE_NUMBER",
+    "OLLAMA_URL": "http://localhost:11434/api/generate",
+    "OLLAMA_MODEL": "llama3.2",
+    "INTEREST_TOPICS": ["технологии", "искусственный интеллект", "наука"],
+    "CHANNELS_TO_MONITOR": ["@channel1", "@channel2"],
+    "CHECK_INTERVAL": 300,
+    "LOG_LEVEL": "INFO"
+}
