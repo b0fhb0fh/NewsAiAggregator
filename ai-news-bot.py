@@ -134,37 +134,18 @@ def format_source_info(chat, message_id):
 # Функция для отправки сообщений в целевой канал
 async def send_message_to_channel(event):
     """
-    Отправляет сообщение в целевой канал используя forward для сохранения оригинала
-    Если forward не удается, копирует сообщение с улучшенной обработкой ошибок
+    Отправляет сообщение в целевой канал используя копирование через Bot API
+    Это гарантирует, что сообщения будут отображаться как непрочитанные
     """
     try:
         message = event.message
         chat = event.chat
         message_id = message.id
         
-        # Пытаемся использовать forward - это сохраняет исходное сообщение со всеми медиа и ссылками
-        try:
-            logging.info(f"Попытка пересылки сообщения {message_id} из {chat.id}")
-            
-            # Получаем entity целевого канала
-            target_entity = await client.get_entity(SUMMARY_CHANNEL_ID)
-            
-            # Пересылаем сообщение
-            await client.forward_messages(
-                entity=target_entity,
-                messages=message_id,
-                from_peer=chat
-            )
-            
-            logging.info(f"Сообщение {message_id} успешно переслано")
-            return
-            
-        except Exception as forward_error:
-            logging.warning(f"Не удалось переслать сообщение {message_id}: {forward_error}")
-            logging.info(f"Попытка копирования сообщения {message_id}")
-            
-            # Если forward не удался, копируем сообщение
-            await copy_message_to_channel(event)
+        # Используем копирование через Bot API вместо forward
+        # Сообщения от бота будут отображаться как непрочитанные
+        logging.info(f"Копирование сообщения {message_id} из {chat.id} в целевой канал")
+        await copy_message_to_channel(event)
             
     except Exception as e:
         logging.error(f"Критическая ошибка при отправке сообщения: {str(e)}", exc_info=True)
@@ -172,7 +153,7 @@ async def send_message_to_channel(event):
 async def copy_message_to_channel(event):
     """
     Копирует сообщение в целевой канал с сохранением всех медиа и ссылок
-    Используется как fallback если forward не работает
+    Сообщения отправляются через Bot API и отображаются как непрочитанные
     """
     try:
         message = event.message
