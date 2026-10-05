@@ -5,6 +5,7 @@ from telethon import TelegramClient, events
 from telethon.tl import types
 from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
 import io
+import html
 import requests
 import json
 import logging
@@ -16,6 +17,10 @@ import signal
 import threading
 from threading import Event
 from io import BytesIO
+
+CAPTION_LIMIT = 1024
+MESSAGE_LIMIT = 4096
+ELLIPSIS = "..."
 
 # Флаг для graceful shutdown
 shutdown = False
@@ -72,6 +77,14 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 # Инициализация Telethon клиента
 client = TelegramClient('session_name', API_ID, API_HASH)
 
+def is_positive_verdict(verdict):
+    """Вердикт положительный, если первое слово — «да» или «yes»."""
+    stripped = verdict.strip().lower()
+    if not stripped:
+        return False
+    first_word = stripped.split(None, 1)[0].strip(".,!?;:\"'«»()[]")
+    return first_word in {"да", "yes"}
+
 # Функция для проверки принадлежности сообщения к интересуемым темам
 def check_topic_relevance(text):
     logging.info("Начало проверки релевантности сообщения.")
@@ -89,9 +102,9 @@ def check_topic_relevance(text):
         logging.info(f"Отправка запроса к Ollama: {payload}")
         response = requests.post(OLLAMA_URL, json=payload)
         if response.status_code == 200:
-            verdict = response.json()["response"].strip().lower()
+            verdict = response.json()["response"].strip()
             logging.info(f"Ответ от Ollama: {verdict}")
-            return "да" in verdict  # Проверяем наличие подстроки "да"
+            return is_positive_verdict(verdict)
         else:
             logging.error(f"Ошибка при запросе к Ollama: {response.status_code}")
             return False
@@ -114,22 +127,136 @@ def get_message_link(chat, message_id):
         # Для каналов без username используем c/format
         return f"https://t.me/c/{str(chat.id)[4:]}/{message_id}"
 
-def format_source_info(chat, message_id):
+def get_source_name(chat):
+    if chat.username:
+        return f"@{chat.username}"
+    if hasattr(chat, "title") and chat.title:
+        return chat.title
+    return f"Канал {chat.id}"
+
+def format_source_parts(chat, message_id):
     """
-    Форматирует информацию об источнике с ссылкой
-    Args:
-        chat: Объект чата из Telethon
-        message_id: ID сообщения
-    Returns:
-        str: Отформатированная строка с источником и ссылкой
+    Возвращает видимый суффикс источника и HTML-версию со ссылкой.
+    HTML остаётся только у ссылки, имя канала экранируется.
     """
     message_link = get_message_link(chat, message_id)
-    if chat.username:
-        source_name = f"@{chat.username}"
+    source_name = get_source_name(chat)
+    visible = f"\n\n🔗 Источник: {source_name}"
+    html_part = f'\n\n🔗 <a href="{message_link}">Источник: {escape_html(source_name)}</a>'
+    return visible, html_part
+
+def utf16_len(text):
+    """Длина строки в единицах UTF-16, как считает Telegram."""
+    return len(text.encode("utf-16-le")) // 2
+
+def escape_html(text):
+    return html.escape(text, quote=False)
+
+def slice_utf16(text, max_units):
+    """Делит текст так, чтобы первая часть занимала не больше max_units UTF-16."""
+    if max_units <= 0:
+        return "", text
+    if utf16_len(text) <= max_units:
+        return text, ""
+    used = 0
+    cut = 0
+    for i, ch in enumerate(text):
+        ch_units = 2 if ord(ch) > 0xFFFF else 1
+        if used + ch_units > max_units:
+            break
+        used += ch_units
+        cut = i + 1
+    return text[:cut], text[cut:]
+
+def build_media_caption(text, source_visible, source_html):
+    """
+    Собирает подпись медиа в лимите 1024.
+    Возвращает (caption_html, хвост исходного текста).
+    Ссылка на источник всегда остаётся в подписи.
+    """
+    if not text:
+        return source_html, ""
+
+    if utf16_len(text + source_visible) <= CAPTION_LIMIT:
+        return escape_html(text) + source_html, ""
+
+    reserved = utf16_len(ELLIPSIS + source_visible)
+    available = CAPTION_LIMIT - reserved
+    if available <= 0:
+        return source_html, text
+
+    head, rest = slice_utf16(text, available)
+    if not rest:
+        return escape_html(head) + source_html, ""
+    return escape_html(head) + ELLIPSIS + source_html, rest
+
+def iter_text_chunks(text, source_visible, source_html, include_source=True):
+    """Режет текст на HTML-куски в лимите обычного сообщения."""
+    if include_source:
+        if not text:
+            yield source_html
+            return
+        if utf16_len(text + source_visible) <= MESSAGE_LIMIT:
+            yield escape_html(text) + source_html
+            return
+        reserved = utf16_len(source_visible)
+        available = MESSAGE_LIMIT - reserved
+        if available <= 0:
+            yield source_html
+            remaining = text
+        else:
+            head, remaining = slice_utf16(text, available)
+            yield escape_html(head) + source_html
     else:
-        source_name = chat.title if hasattr(chat, 'title') and chat.title else f"Канал {chat.id}"
-    
-    return f"\n\n🔗 <a href=\"{message_link}\">Источник: {source_name}</a>"
+        remaining = text
+
+    while remaining:
+        part, remaining = slice_utf16(remaining, MESSAGE_LIMIT)
+        yield escape_html(part)
+
+async def send_html_messages(chunks, reply_to_message_id=None, disable_web_page_preview=False):
+    last = None
+    for chunk in chunks:
+        last = await asyncio.to_thread(
+            bot.send_message,
+            chat_id=SUMMARY_CHANNEL_ID,
+            text=chunk,
+            parse_mode="HTML",
+            disable_web_page_preview=disable_web_page_preview,
+            reply_to_message_id=reply_to_message_id,
+        )
+    return last
+
+async def send_media_buffer(message, buffer, caption):
+    buffer.seek(0)
+    media = message.media
+    if isinstance(media, types.MessageMediaPhoto):
+        return await asyncio.to_thread(
+            bot.send_photo,
+            chat_id=SUMMARY_CHANNEL_ID,
+            photo=buffer,
+            caption=caption,
+            parse_mode="HTML",
+        )
+    if isinstance(media, types.MessageMediaDocument):
+        doc = media.document
+        mime_type = getattr(doc, "mime_type", None) if doc else None
+        if mime_type and mime_type.startswith("video/"):
+            return await asyncio.to_thread(
+                bot.send_video,
+                chat_id=SUMMARY_CHANNEL_ID,
+                video=buffer,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        return await asyncio.to_thread(
+            bot.send_document,
+            chat_id=SUMMARY_CHANNEL_ID,
+            document=buffer,
+            caption=caption,
+            parse_mode="HTML",
+        )
+    return None
 
 # Функция для отправки сообщений в целевой канал
 async def send_message_to_channel(event):
@@ -159,119 +286,66 @@ async def copy_message_to_channel(event):
         message = event.message
         chat = event.chat
         message_id = message.id
-        
-        # Получаем ссылку на исходное сообщение
-        source_info = format_source_info(chat, message_id)
-        
-        # Обработка текстового сообщения без медиа
-        if not hasattr(message, 'media') or not message.media:
-            text = message.text or ""
-            # Сохраняем оригинальный текст без изменений
-            if text:
-                full_text = text + source_info
-                await asyncio.to_thread(
-                    lambda: bot.send_message(
-                        chat_id=SUMMARY_CHANNEL_ID,
-                        text=full_text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=False
-                    )
-                )
-            else:
-                # Если нет текста, отправляем только ссылку на источник
-                await asyncio.to_thread(
-                    lambda: bot.send_message(
-                        chat_id=SUMMARY_CHANNEL_ID,
-                        text=f"📎 Медиа без текста{source_info}",
-                        parse_mode="HTML"
-                    )
-                )
+        text = message.text or ""
+        source_visible, source_html = format_source_parts(chat, message_id)
+
+        has_media = hasattr(message, "media") and message.media
+        is_supported_media = has_media and isinstance(
+            message.media, (types.MessageMediaPhoto, types.MessageMediaDocument)
+        )
+
+        if not has_media:
+            chunks = iter_text_chunks(text or "📎 Медиа без текста", source_visible, source_html)
+            await send_html_messages(chunks)
             return
 
-        # Обработка медиа
+        if not is_supported_media:
+            logging.warning(f"Неподдерживаемый тип медиа: {type(message.media)}")
+            fallback = f"{text}\n\n⚠️ Неподдерживаемый тип медиа" if text else "⚠️ Неподдерживаемый тип медиа"
+            await send_html_messages(iter_text_chunks(fallback, source_visible, source_html))
+            return
+
+        buffer = BytesIO()
         try:
-            # Загружаем медиа в буфер
-            buffer = BytesIO()
-            await message.download_media(file=buffer)
-            buffer.seek(0)
-            
-            if buffer.getbuffer().nbytes == 0:
-                raise ValueError("Получен пустой файл")
-            
-            # Определяем тип медиа и текст подписи
-            caption = (message.text or "") + source_info if message.text else source_info
-            
-            # Определение типа медиа
-            if isinstance(message.media, types.MessageMediaPhoto):
-                await asyncio.to_thread(
-                    lambda: bot.send_photo(
-                        chat_id=SUMMARY_CHANNEL_ID,
-                        photo=buffer,
-                        caption=caption if caption else None,
-                        parse_mode="HTML"
-                    )
+            try:
+                await message.download_media(file=buffer)
+                buffer.seek(0)
+                if buffer.getbuffer().nbytes == 0:
+                    raise ValueError("Получен пустой файл")
+            except Exception as download_error:
+                logging.error(
+                    f"Ошибка при загрузке медиа сообщения {message_id}: {download_error}",
+                    exc_info=True,
                 )
-            elif isinstance(message.media, types.MessageMediaDocument):
-                # Проверяем, является ли документ видео или другим типом
-                doc = message.media.document
-                mime_type = None
-                if doc and hasattr(doc, 'mime_type'):
-                    mime_type = doc.mime_type
-                
-                if mime_type and mime_type.startswith('video/'):
-                    await asyncio.to_thread(
-                        lambda: bot.send_video(
-                            chat_id=SUMMARY_CHANNEL_ID,
-                            video=buffer,
-                            caption=caption if caption else None,
-                            parse_mode="HTML"
-                        )
+                fallback = f"{text}\n\n⚠️ Не удалось загрузить медиа" if text else "⚠️ Не удалось загрузить медиа"
+                await send_html_messages(iter_text_chunks(fallback, source_visible, source_html))
+                return
+
+            caption, remainder = build_media_caption(text, source_visible, source_html)
+            if remainder:
+                logging.info(
+                    f"Подпись сообщения {message_id} превышает {CAPTION_LIMIT}, "
+                    "хвост текста отправим ответом"
+                )
+
+            try:
+                sent = await send_media_buffer(message, buffer, caption)
+                if remainder and sent is not None:
+                    await send_html_messages(
+                        iter_text_chunks(remainder, source_visible, source_html, include_source=False),
+                        reply_to_message_id=sent.message_id,
+                        disable_web_page_preview=True,
                     )
-                else:
-                    await asyncio.to_thread(
-                        lambda: bot.send_document(
-                            chat_id=SUMMARY_CHANNEL_ID,
-                            document=buffer,
-                            caption=caption if caption else None,
-                            parse_mode="HTML"
-                        )
-                    )
-            else:
-                logging.warning(f"Неподдерживаемый тип медиа: {type(message.media)}")
-                # Отправляем текст с ссылкой на источник
-                text = message.text or ""
-                if text:
-                    await asyncio.to_thread(
-                        lambda: bot.send_message(
-                            chat_id=SUMMARY_CHANNEL_ID,
-                            text=f"{text}\n\n⚠️ Неподдерживаемый тип медиа{source_info}",
-                            parse_mode="HTML"
-                        )
-                    )
-            
+            except Exception as send_error:
+                logging.error(
+                    f"Ошибка при отправке медиа сообщения {message_id}: {send_error}",
+                    exc_info=True,
+                )
+                fallback = f"{text}\n\n⚠️ Не удалось отправить медиа" if text else "⚠️ Не удалось отправить медиа"
+                await send_html_messages(iter_text_chunks(fallback, source_visible, source_html))
+        finally:
             buffer.close()
-            
-        except Exception as media_error:
-            logging.error(f"Ошибка при обработке медиа сообщения {message_id}: {media_error}", exc_info=True)
-            # Отправляем текст как запасной вариант
-            text = message.text or ""
-            if text:
-                await asyncio.to_thread(
-                    lambda: bot.send_message(
-                        chat_id=SUMMARY_CHANNEL_ID,
-                        text=f"{text}\n\n⚠️ Не удалось загрузить медиа{source_info}",
-                        parse_mode="HTML"
-                    )
-                )
-            else:
-                await asyncio.to_thread(
-                    lambda: bot.send_message(
-                        chat_id=SUMMARY_CHANNEL_ID,
-                        text=f"⚠️ Ошибка при обработке медиа{source_info}",
-                        parse_mode="HTML"
-                    )
-                )
-            
+
     except Exception as e:
         logging.error(f"Ошибка при копировании сообщения: {str(e)}", exc_info=True)
             
@@ -292,9 +366,13 @@ async def handle_new_message(event):
 
         logging.info(f"Новое сообщение {message_id} из {chat_name}")
         
-        # Проверка релевантности
+        # Проверка релевантности — синхронный запрос к Ollama в отдельном потоке
         message_text = message.text or ""
-        is_relevant = check_topic_relevance(message_text) if message_text else True
+        is_relevant = (
+            await asyncio.to_thread(check_topic_relevance, message_text)
+            if message_text
+            else True
+        )
         
         if is_relevant:
             await send_message_to_channel(event)
