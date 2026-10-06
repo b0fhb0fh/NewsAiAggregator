@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import telebot
+from telebot.types import InputMediaDocument, InputMediaPhoto, InputMediaVideo
 from telethon import TelegramClient, events
 from telethon.tl import types
 from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
@@ -73,6 +74,7 @@ logging.basicConfig(
 
 # Инициализация бота
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+bot_send_lock = asyncio.Lock()
 
 # Инициализация Telethon клиента
 client = TelegramClient('session_name', API_ID, API_HASH)
@@ -133,6 +135,55 @@ def get_source_name(chat):
     if hasattr(chat, "title") and chat.title:
         return chat.title
     return f"Канал {chat.id}"
+
+def get_message_text(message):
+    """Подпись/текст: raw_text надёжнее, чем .text (markdown)."""
+    for attr in ("raw_text", "message", "text"):
+        value = getattr(message, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+def get_album_text(event):
+    for attr in ("raw_text", "text"):
+        value = getattr(event, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    for message in getattr(event, "messages", None) or []:
+        text = get_message_text(message)
+        if text:
+            return text
+    return ""
+
+def media_kind(message):
+    media = getattr(message, "media", None)
+    if isinstance(media, types.MessageMediaPhoto):
+        return "photo"
+    if isinstance(media, types.MessageMediaDocument):
+        doc = getattr(media, "document", None)
+        mime_type = getattr(doc, "mime_type", None) if doc else None
+        if mime_type and mime_type.startswith("video/"):
+            return "video"
+        return "document"
+    return None
+
+def is_downloadable_media(message):
+    return media_kind(message) is not None
+
+def attach_buffer_name(buffer, message):
+    kind = media_kind(message)
+    if kind == "photo":
+        buffer.name = f"photo_{message.id}.jpg"
+        return
+    doc = getattr(getattr(message, "media", None), "document", None)
+    if doc:
+        for attr in getattr(doc, "attributes", []) or []:
+            file_name = getattr(attr, "file_name", None)
+            if file_name:
+                buffer.name = file_name
+                return
+    ext = "mp4" if kind == "video" else "bin"
+    buffer.name = f"file_{message.id}.{ext}"
 
 def format_source_parts(chat, message_id):
     """
@@ -214,49 +265,118 @@ def iter_text_chunks(text, source_visible, source_html, include_source=True):
         part, remaining = slice_utf16(remaining, MESSAGE_LIMIT)
         yield escape_html(part)
 
+async def bot_call(func, *args, **kwargs):
+    async with bot_send_lock:
+        return await asyncio.to_thread(func, *args, **kwargs)
+
 async def send_html_messages(chunks, reply_to_message_id=None, disable_web_page_preview=False):
     last = None
+    use_reply = reply_to_message_id
     for chunk in chunks:
-        last = await asyncio.to_thread(
-            bot.send_message,
-            chat_id=SUMMARY_CHANNEL_ID,
-            text=chunk,
-            parse_mode="HTML",
-            disable_web_page_preview=disable_web_page_preview,
-            reply_to_message_id=reply_to_message_id,
-        )
+        try:
+            last = await bot_call(
+                bot.send_message,
+                chat_id=SUMMARY_CHANNEL_ID,
+                text=chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=disable_web_page_preview,
+                reply_to_message_id=use_reply,
+            )
+        except Exception:
+            if not use_reply:
+                raise
+            logging.warning("Не удалось ответить на сообщение, отправляем текст отдельно")
+            last = await bot_call(
+                bot.send_message,
+                chat_id=SUMMARY_CHANNEL_ID,
+                text=chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=disable_web_page_preview,
+            )
+            use_reply = None
     return last
 
 async def send_media_buffer(message, buffer, caption):
+    attach_buffer_name(buffer, message)
     buffer.seek(0)
-    media = message.media
-    if isinstance(media, types.MessageMediaPhoto):
-        return await asyncio.to_thread(
-            bot.send_photo,
-            chat_id=SUMMARY_CHANNEL_ID,
-            photo=buffer,
-            caption=caption,
-            parse_mode="HTML",
-        )
-    if isinstance(media, types.MessageMediaDocument):
-        doc = media.document
-        mime_type = getattr(doc, "mime_type", None) if doc else None
-        if mime_type and mime_type.startswith("video/"):
-            return await asyncio.to_thread(
-                bot.send_video,
-                chat_id=SUMMARY_CHANNEL_ID,
-                video=buffer,
-                caption=caption,
-                parse_mode="HTML",
-            )
-        return await asyncio.to_thread(
-            bot.send_document,
-            chat_id=SUMMARY_CHANNEL_ID,
-            document=buffer,
-            caption=caption,
-            parse_mode="HTML",
-        )
+    kind = media_kind(message)
+    extra = {}
+    if caption:
+        extra["caption"] = caption
+        extra["parse_mode"] = "HTML"
+    if kind == "photo":
+        return await bot_call(bot.send_photo, chat_id=SUMMARY_CHANNEL_ID, photo=buffer, **extra)
+    if kind == "video":
+        return await bot_call(bot.send_video, chat_id=SUMMARY_CHANNEL_ID, video=buffer, **extra)
+    if kind == "document":
+        return await bot_call(bot.send_document, chat_id=SUMMARY_CHANNEL_ID, document=buffer, **extra)
     return None
+
+def named_file_copy(buffer, message):
+    attach_buffer_name(buffer, message)
+    buffer.seek(0)
+    copy = BytesIO(buffer.getvalue())
+    copy.name = buffer.name
+    return copy
+
+def to_input_media(message, buffer, caption=None):
+    extra = {}
+    if caption:
+        extra["caption"] = caption
+        extra["parse_mode"] = "HTML"
+    file_obj = named_file_copy(buffer, message)
+    kind = media_kind(message)
+    if kind == "photo":
+        return InputMediaPhoto(file_obj, **extra)
+    if kind == "video":
+        return InputMediaVideo(file_obj, **extra)
+    return InputMediaDocument(file_obj, **extra)
+
+async def send_grouped_media(items, caption):
+    """Отправляет 1+ файлов. Подпись только у первого. Группы по 10 — лимит Bot API."""
+    sent = []
+    first = True
+    for start in range(0, len(items), 10):
+        chunk = items[start:start + 10]
+        chunk_caption = caption if first else None
+        if len(chunk) == 1:
+            message = await send_media_buffer(chunk[0][0], chunk[0][1], chunk_caption)
+            if message is not None:
+                sent.append(message)
+        else:
+            try:
+                media = [
+                    to_input_media(message, buffer, chunk_caption if i == 0 else None)
+                    for i, (message, buffer) in enumerate(chunk)
+                ]
+                sent.extend(await bot_call(bot.send_media_group, chat_id=SUMMARY_CHANNEL_ID, media=media) or [])
+            except Exception as group_error:
+                logging.warning(f"send_media_group не удался, отправляем файлы по одному: {group_error}")
+                for i, (message, buffer) in enumerate(chunk):
+                    item = await send_media_buffer(message, buffer, chunk_caption if i == 0 else None)
+                    if item is not None:
+                        sent.append(item)
+        first = False
+    return sent
+
+async def download_to_buffer(message):
+    buffer = BytesIO()
+    await message.download_media(file=buffer)
+    buffer.seek(0)
+    if buffer.getbuffer().nbytes == 0:
+        buffer.close()
+        raise ValueError("Получен пустой файл")
+    attach_buffer_name(buffer, message)
+    return buffer
+
+async def send_remainder(remainder, source_visible, source_html, reply_to_message_id=None):
+    if not remainder:
+        return
+    await send_html_messages(
+        iter_text_chunks(remainder, source_visible, source_html, include_source=False),
+        reply_to_message_id=reply_to_message_id,
+        disable_web_page_preview=True,
+    )
 
 # Функция для отправки сообщений в целевой канал
 async def send_message_to_channel(event):
@@ -286,32 +406,28 @@ async def copy_message_to_channel(event):
         message = event.message
         chat = event.chat
         message_id = message.id
-        text = message.text or ""
+        text = get_message_text(message)
         source_visible, source_html = format_source_parts(chat, message_id)
 
-        has_media = hasattr(message, "media") and message.media
-        is_supported_media = has_media and isinstance(
-            message.media, (types.MessageMediaPhoto, types.MessageMediaDocument)
-        )
-
-        if not has_media:
-            chunks = iter_text_chunks(text or "📎 Медиа без текста", source_visible, source_html)
-            await send_html_messages(chunks)
+        if not is_downloadable_media(message):
+            if text:
+                await send_html_messages(iter_text_chunks(text, source_visible, source_html))
+                return
+            if getattr(message, "media", None):
+                logging.warning(f"Неподдерживаемый тип медиа: {type(message.media)}")
+                await send_html_messages(
+                    iter_text_chunks("⚠️ Неподдерживаемый тип медиа", source_visible, source_html)
+                )
+            else:
+                await send_html_messages(
+                    iter_text_chunks("📎 Медиа без текста", source_visible, source_html)
+                )
             return
 
-        if not is_supported_media:
-            logging.warning(f"Неподдерживаемый тип медиа: {type(message.media)}")
-            fallback = f"{text}\n\n⚠️ Неподдерживаемый тип медиа" if text else "⚠️ Неподдерживаемый тип медиа"
-            await send_html_messages(iter_text_chunks(fallback, source_visible, source_html))
-            return
-
-        buffer = BytesIO()
+        buffer = None
         try:
             try:
-                await message.download_media(file=buffer)
-                buffer.seek(0)
-                if buffer.getbuffer().nbytes == 0:
-                    raise ValueError("Получен пустой файл")
+                buffer = await download_to_buffer(message)
             except Exception as download_error:
                 logging.error(
                     f"Ошибка при загрузке медиа сообщения {message_id}: {download_error}",
@@ -330,12 +446,12 @@ async def copy_message_to_channel(event):
 
             try:
                 sent = await send_media_buffer(message, buffer, caption)
-                if remainder and sent is not None:
-                    await send_html_messages(
-                        iter_text_chunks(remainder, source_visible, source_html, include_source=False),
-                        reply_to_message_id=sent.message_id,
-                        disable_web_page_preview=True,
-                    )
+                await send_remainder(
+                    remainder,
+                    source_visible,
+                    source_html,
+                    reply_to_message_id=getattr(sent, "message_id", None),
+                )
             except Exception as send_error:
                 logging.error(
                     f"Ошибка при отправке медиа сообщения {message_id}: {send_error}",
@@ -344,43 +460,101 @@ async def copy_message_to_channel(event):
                 fallback = f"{text}\n\n⚠️ Не удалось отправить медиа" if text else "⚠️ Не удалось отправить медиа"
                 await send_html_messages(iter_text_chunks(fallback, source_visible, source_html))
         finally:
-            buffer.close()
+            if buffer is not None:
+                buffer.close()
 
     except Exception as e:
         logging.error(f"Ошибка при копировании сообщения: {str(e)}", exc_info=True)
+
+async def copy_album_to_channel(event):
+    """Скачивает все файлы альбома и публикует их одним media group."""
+    messages = list(event.messages or [])
+    if not messages:
+        return
+
+    chat = event.chat
+    text = get_album_text(event)
+    source_visible, source_html = format_source_parts(chat, messages[0].id)
+    logging.info(f"Копирование альбома из {len(messages)} сообщений ({chat.id})")
+
+    items = []
+    try:
+        for message in messages:
+            if not is_downloadable_media(message):
+                continue
+            try:
+                items.append((message, await download_to_buffer(message)))
+            except Exception as download_error:
+                logging.error(
+                    f"Ошибка при загрузке медиа альбома {message.id}: {download_error}",
+                    exc_info=True,
+                )
+
+        if not items:
+            fallback = text if text else "⚠️ Не удалось загрузить медиа"
+            await send_html_messages(iter_text_chunks(fallback, source_visible, source_html))
+            return
+
+        caption, remainder = build_media_caption(text, source_visible, source_html)
+        if remainder:
+            logging.info("Подпись альбома превышает лимит, хвост текста отправим отдельно")
+
+        try:
+            sent = await send_grouped_media(items, caption)
+            reply_to = sent[0].message_id if sent else None
+            await send_remainder(remainder, source_visible, source_html, reply_to_message_id=reply_to)
+        except Exception as send_error:
+            logging.error(f"Ошибка при отправке альбома: {send_error}", exc_info=True)
+            fallback = f"{text}\n\n⚠️ Не удалось отправить медиа" if text else "⚠️ Не удалось отправить медиа"
+            await send_html_messages(iter_text_chunks(fallback, source_visible, source_html))
+    finally:
+        for _, buffer in items:
+            buffer.close()
             
+def chat_log_name(chat):
+    if chat.username:
+        return f"@{chat.username}"
+    if hasattr(chat, "title") and chat.title:
+        return chat.title
+    return f"id{chat.id}"
+
+async def is_relevant_text(text):
+    if not text:
+        return True
+    return await asyncio.to_thread(check_topic_relevance, text)
+
 # Обработчик новых сообщений из каналов
 async def handle_new_message(event):
     try:
-        chat = event.chat
         message = event.message
-        message_id = message.id
-        
-        # Определяем имя канала для логирования
-        if chat.username:
-            chat_name = f"@{chat.username}"
-        elif hasattr(chat, 'title') and chat.title:
-            chat_name = chat.title
-        else:
-            chat_name = f"id{chat.id}"
+        if getattr(message, "grouped_id", None):
+            return
 
-        logging.info(f"Новое сообщение {message_id} из {chat_name}")
-        
-        # Проверка релевантности — синхронный запрос к Ollama в отдельном потоке
-        message_text = message.text or ""
-        is_relevant = (
-            await asyncio.to_thread(check_topic_relevance, message_text)
-            if message_text
-            else True
-        )
-        
-        if is_relevant:
+        chat = event.chat
+        message_id = message.id
+        logging.info(f"Новое сообщение {message_id} из {chat_log_name(chat)}")
+
+        message_text = get_message_text(message)
+        if await is_relevant_text(message_text):
             await send_message_to_channel(event)
         else:
             logging.debug(f"Сообщение {message_id} не релевантно, пропускаем")
 
     except Exception as e:
         logging.error(f"Ошибка обработки сообщения: {str(e)}", exc_info=True)
+
+async def handle_album(event):
+    try:
+        messages = list(event.messages or [])
+        chat = event.chat
+        logging.info(f"Новый альбом из {len(messages)} сообщений в {chat_log_name(chat)}")
+
+        if await is_relevant_text(get_album_text(event)):
+            await copy_album_to_channel(event)
+        else:
+            logging.debug("Альбом не релевантен, пропускаем")
+    except Exception as e:
+        logging.error(f"Ошибка обработки альбома: {str(e)}", exc_info=True)
 
 # Функция для валидации и фильтрации каналов
 async def validate_channels(channels):
@@ -422,12 +596,17 @@ async def run_telethon():
         
         logging.info(f"Регистрация обработчика для {len(valid_channels)} валидных каналов")
         
-        # Регистрируем обработчик для валидных каналов
+        # Альбом приходит и как NewMessage на каждый файл, и как events.Album.
+        # grouped_id пропускаем в NewMessage, иначе уйдёт только один файл без подписи.
+        @client.on(events.Album(chats=valid_channels))
+        async def album_handler(event):
+            await handle_album(event)
+
         @client.on(events.NewMessage(chats=valid_channels))
         async def message_handler(event):
             await handle_new_message(event)
         
-        logging.info("Обработчик сообщений успешно зарегистрирован")
+        logging.info("Обработчики сообщений и альбомов успешно зарегистрированы")
         
         # Ждем флаг завершения
         while not shutdown:
