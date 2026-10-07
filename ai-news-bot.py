@@ -61,6 +61,12 @@ CHANNELS_TO_MONITOR = config["CHANNELS_TO_MONITOR"]
 # Необязательные параметры (с значениями по умолчанию)
 CHECK_INTERVAL = config.get("CHECK_INTERVAL", 300)  # Значение по умолчанию: 300 секунд
 LOG_LEVEL = config.get("LOG_LEVEL", "INFO")  # Значение по умолчанию: INFO
+OLLAMA_TIMEOUT = config.get("OLLAMA_TIMEOUT", 30)
+OLLAMA_FAIL_COOLDOWN = config.get("OLLAMA_FAIL_COOLDOWN", 60)
+# Если Ollama недоступна — публикуем, а не молча отбрасываем все новости
+PUBLISH_ON_OLLAMA_ERROR = config.get("PUBLISH_ON_OLLAMA_ERROR", True)
+
+_ollama_unavailable_until = 0.0
 
 # Настройка логирования
 logging.basicConfig(
@@ -87,11 +93,30 @@ def is_positive_verdict(verdict):
     first_word = stripped.split(None, 1)[0].strip(".,!?;:\"'«»()[]")
     return first_word in {"да", "yes"}
 
+def _ollama_error_decision(reason):
+    """При сбое фильтра не теряем новости: по умолчанию публикуем."""
+    global _ollama_unavailable_until
+    _ollama_unavailable_until = time.time() + OLLAMA_FAIL_COOLDOWN
+    if PUBLISH_ON_OLLAMA_ERROR:
+        logging.warning(
+            f"{reason}. Публикуем без фильтра, следующая попытка Ollama через "
+            f"{OLLAMA_FAIL_COOLDOWN} с."
+        )
+        return True
+    logging.error(f"{reason}. Сообщение пропущено (PUBLISH_ON_OLLAMA_ERROR=false).")
+    return False
+
 # Функция для проверки принадлежности сообщения к интересуемым темам
 def check_topic_relevance(text):
+    global _ollama_unavailable_until
+    if time.time() < _ollama_unavailable_until:
+        if PUBLISH_ON_OLLAMA_ERROR:
+            logging.warning("Ollama ещё недоступна, публикуем без фильтра.")
+            return True
+        return False
+
     logging.info("Начало проверки релевантности сообщения.")
     try:
-        # Формируем запрос к Ollama
         prompt = (
             f"Прочитай это сообщение и определи, относится ли оно к одной из этих тем: {', '.join(INTEREST_TOPICS)}. "
             f"Ответь только 'Да' или 'Нет'.\n\nСообщение: {text}"
@@ -101,18 +126,16 @@ def check_topic_relevance(text):
             "prompt": prompt,
             "stream": False
         }
-        logging.info(f"Отправка запроса к Ollama: {payload}")
-        response = requests.post(OLLAMA_URL, json=payload)
+        logging.info(f"Запрос к Ollama: model={OLLAMA_MODEL}, text_len={len(text)}")
+        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
         if response.status_code == 200:
+            _ollama_unavailable_until = 0.0
             verdict = response.json()["response"].strip()
             logging.info(f"Ответ от Ollama: {verdict}")
             return is_positive_verdict(verdict)
-        else:
-            logging.error(f"Ошибка при запросе к Ollama: {response.status_code}")
-            return False
+        return _ollama_error_decision(f"Ollama вернула HTTP {response.status_code}")
     except Exception as e:
-        logging.error(f"Ошибка в функции check_topic_relevance: {e}")
-        return False
+        return _ollama_error_decision(f"Ollama недоступна ({e})")
 
 def get_message_link(chat, message_id):
     """
@@ -538,7 +561,7 @@ async def handle_new_message(event):
         if await is_relevant_text(message_text):
             await send_message_to_channel(event)
         else:
-            logging.debug(f"Сообщение {message_id} не релевантно, пропускаем")
+            logging.info(f"Сообщение {message_id} не релевантно, пропускаем")
 
     except Exception as e:
         logging.error(f"Ошибка обработки сообщения: {str(e)}", exc_info=True)
@@ -552,7 +575,7 @@ async def handle_album(event):
         if await is_relevant_text(get_album_text(event)):
             await copy_album_to_channel(event)
         else:
-            logging.debug("Альбом не релевантен, пропускаем")
+            logging.info("Альбом не релевантен, пропускаем")
     except Exception as e:
         logging.error(f"Ошибка обработки альбома: {str(e)}", exc_info=True)
 
