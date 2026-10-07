@@ -9,7 +9,10 @@
     "INTEREST_TOPICS": ["технологии", "искусственный интеллект", "наука"],
     "CHANNELS_TO_MONITOR": ["@channel1", "@channel2"],
     "CHECK_INTERVAL": 300,
-    "LOG_LEVEL": "INFO"
+    "LOG_LEVEL": "INFO",
+    "OLLAMA_TIMEOUT": 30,
+    "OLLAMA_FAIL_COOLDOWN": 60,
+    "PUBLISH_ON_OLLAMA_ERROR": true
 }
 
 
